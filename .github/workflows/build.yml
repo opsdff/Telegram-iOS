@@ -62,30 +62,10 @@ jobs:
           OUTPUT_PATH="build/artifacts"
           rm -rf "$OUTPUT_PATH"
           mkdir -p "$OUTPUT_PATH"
-          echo "Archiving bazel-out..."
-          zip -r "$OUTPUT_PATH/bazel-out.zip" bazel-out/ 1>/dev/null
-          echo "Archive size: $(du -sh $OUTPUT_PATH/bazel-out.zip)"
+          find bazel-out -name "Telegram.ipa" -exec cp {} build/artifacts/ \;
 
-      - name: Create Release
-        id: create_release
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
         with:
-          tag_name: build-${{ env.BUILD_NUMBER }}
-          release_name: Telegram ${{ env.APP_VERSION }} (${{ env.BUILD_NUMBER }})
-          body: |
-            An unsigned build of Telegram for iOS ${{ env.APP_VERSION }} (${{ env.BUILD_NUMBER }})
-          draft: false
-          prerelease: false
-
-      - name: Upload bazel-out archive
-        id: upload-release-bazel
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: /Users/Shared/telegram-ios/build/artifacts/bazel-out.zip
-          asset_name: bazel-out.zip
-          asset_content_type: application/zip
+          name: ios-build-${{ env.BUILD_NUMBER }}
+          path: build/artifacts/
