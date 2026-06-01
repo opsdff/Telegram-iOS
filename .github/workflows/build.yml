@@ -58,11 +58,13 @@ jobs:
             --configuration=release_arm64 \
             --buildNumber="$BUILD_NUMBER"
 
-          # archive entire bazel-out
+          # copy bazel-out to artifacts folder
           OUTPUT_PATH="$GITHUB_WORKSPACE/build/artifacts"
           rm -rf "$OUTPUT_PATH"
           mkdir -p "$OUTPUT_PATH"
-          find bazel-out -name "Telegram.ipa" -exec cp {} $GITHUB_WORKSPACE/build/artifacts/ \;
+          echo "Copying bazel-out..."
+          cp -R bazel-out "$OUTPUT_PATH/bazel-out"
+          ls -lh "$OUTPUT_PATH/"
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
