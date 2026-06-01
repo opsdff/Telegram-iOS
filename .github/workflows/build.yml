@@ -58,16 +58,8 @@ jobs:
             --configuration=release_arm64 \
             --buildNumber="$BUILD_NUMBER"
 
-          # copy bazel-out to artifacts folder
-          OUTPUT_PATH="$GITHUB_WORKSPACE/build/artifacts"
-          rm -rf "$OUTPUT_PATH"
-          mkdir -p "$OUTPUT_PATH"
-          echo "Copying bazel-out..."
-          cp -R bazel-out "$OUTPUT_PATH/bazel-out"
-          ls -lh "$OUTPUT_PATH/"
-
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ios-build-${{ env.BUILD_NUMBER }}
-          path: build/artifacts/
+          path: /Users/Shared/telegram-ios/bazel-out/
