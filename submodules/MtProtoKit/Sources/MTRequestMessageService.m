@@ -470,17 +470,17 @@
         currentData = buffer.data;
     }
     
-    if ((_apiEnvironment != nil && _apiEnvironment.disableUpdates) || _forceBackgroundRequests)
-    {
-        MTBuffer *buffer = [[MTBuffer alloc] init];
-        
-        [buffer appendInt32:(int32_t)0xbf9459b7];
+    // if ((_apiEnvironment != nil && _apiEnvironment.disableUpdates) || _forceBackgroundRequests)
+    // {
+    //     MTBuffer *buffer = [[MTBuffer alloc] init];
 
-        [buffer appendBytes:currentData.bytes length:currentData.length];
-        currentData = buffer.data;
-        
-        debugDescription = [debugDescription stringByAppendingString:@", disableUpdates"];
-    }
+    //     [buffer appendInt32:(int32_t)0xbf9459b7];
+
+    //     [buffer appendBytes:currentData.bytes length:currentData.length];
+    //     currentData = buffer.data;
+
+    //     debugDescription = [debugDescription stringByAppendingString:@", disableUpdates"];
+    // }
     
     if (request.shouldDependOnRequest != nil)
     {

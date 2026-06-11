@@ -1,0 +1,325 @@
+name: CI
+
+on:
+  push:
+    branches: [ master ]
+
+  pull_request:
+    branches: [ master ]
+
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 360
+
+    permissions:
+      contents: write   # нужно для создания GitHub Release с .ipa
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: 'recursive'
+          fetch-depth: 0
+
+      - name: Set active Xcode path
+        run: |
+          XCODE_VERSION=$(cat versions.json | python3 -c 'import json,sys;obj=json.load(sys.stdin);print(obj["xcode"]);')
+          sudo xcode-select -s /Applications/Xcode_$XCODE_VERSION.app/Contents/Developer
+          xcodebuild -version
+
+      # Кэширую bazel root + локальный disk_cache между прогонами:
+      # iOS-сборка телеги ~20 минут вхолостую, с кешем держится ~6 минут.
+      # Ключ привязан к pinу bazel + sha submodule'ов чтобы не подтягивать
+      # битый кеш после обновления tgcalls/webrtc/td.
+      - name: Cache bazel
+        uses: actions/cache@v4
+        with:
+          path: |
+            /private/var/tmp/_bazel_containerhost
+            ~/.cache/bazel-disk-cache
+          key: bazel-${{ runner.os }}-${{ hashFiles('versions.json', '.gitmodules', '**/BUILD', '**/*.bzl') }}
+          restore-keys: |
+            bazel-${{ runner.os }}-
+
+      - name: Create canonical source directory
+        run: |
+          set -x
+          # Путь к исходникам захардкожен в Bazel-кешах через `--source_dir`-подобные
+          # параметры — пересборка из другого пути получит cache miss.
+          sudo mkdir -p /Users/Shared
+          cp -R "$GITHUB_WORKSPACE" /Users/Shared/
+          mv "/Users/Shared/$(basename "$GITHUB_WORKSPACE")" /Users/Shared/telegram-ios
+
+      - name: Generate self-signed signing cert (overwrite SelfSigned.p12)
+        run: |
+          set -x
+          # Все остальные шаги работают из /Users/Shared/telegram-ios
+          # (canonical path для bazel-кеша). Если писать в относительный
+          # путь от $GITHUB_WORKSPACE — regen-step возьмёт исходный p12 из
+          # каноничного пути и перепишет всё в FZ-LLC. Поэтому cd сюда.
+          cd /Users/Shared/telegram-ios
+          # SelfSigned.p12 в репе — на самом деле публичная часть реального
+          # AppStore cert'а от Telegram FZ-LLC (CN = "Apple Distribution:
+          # Telegram FZ-LLC (C67CF9S4VU)"), без работающего private key.
+          # GenerateProfiles вшивает его DER в DeveloperCertificates, потом
+          # codesign на хосте ищет identity с этим cert + matching private
+          # key и не находит. Поэтому генерю свежую self-signed пару прямо
+          # в CI — эфемерно, в репу не комитим.
+          #
+          # openssl (что homebrew 3.x, что системный на macos-26) пишет
+          # PKCS#12 с PBMAC1+PBKDF2 для MAC-KDF — Apple Security такой
+          # формат отвергает с 'MAC verification failed during PKCS12
+          # import'. -legacy и -macalg sha1 переключают только PBE для
+          # encryption, а MAC всё равно идёт через PBMAC1.
+          #
+          # Поэтому генерю p12 через python cryptography с явным
+          # PBES1HmacSHA1And3KeyTripleDESCBC и SHA1 hmac — это классический
+          # PKCS#12 v1 KDF из PKCS#5 v1, Security его разбирает.
+          #
+          # extendedKeyUsage=codeSigning обязателен: security find-identity
+          # -p codesigning отбирает identity именно по этому EKU.
+          pip3 install --quiet --user --break-system-packages cryptography
+          python3 - <<'EOF'
+          import datetime
+          from cryptography import x509
+          from cryptography.hazmat.primitives import hashes, serialization
+          from cryptography.hazmat.primitives.asymmetric import rsa
+          from cryptography.hazmat.primitives.serialization import pkcs12, PrivateFormat
+          from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+
+          key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+          subject = x509.Name([
+              x509.NameAttribute(NameOID.COMMON_NAME, "Opengram Fake Signing"),
+              x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Opengram"),
+              x509.NameAttribute(NameOID.COUNTRY_NAME, "RU"),
+          ])
+          now = datetime.datetime.now(datetime.timezone.utc)
+          cert = (
+              x509.CertificateBuilder()
+              .subject_name(subject)
+              .issuer_name(subject)
+              .public_key(key.public_key())
+              .serial_number(x509.random_serial_number())
+              .not_valid_before(now)
+              .not_valid_after(now + datetime.timedelta(days=3650))
+              .add_extension(
+                  x509.ExtendedKeyUsage([ExtendedKeyUsageOID.CODE_SIGNING]),
+                  critical=False,
+              )
+              # Без явного KeyUsage Apple's codeSigning policy ругается
+              # 'Invalid Key Usage for policy' и find-identity -v пишет
+              # identity как невалидный, даже когда EKU=codeSigning есть.
+              # digitalSignature — минимально достаточный set для codesign.
+              .add_extension(
+                  x509.KeyUsage(
+                      digital_signature=True,
+                      content_commitment=False,
+                      key_encipherment=False,
+                      data_encipherment=False,
+                      key_agreement=False,
+                      key_cert_sign=False,
+                      crl_sign=False,
+                      encipher_only=False,
+                      decipher_only=False,
+                  ),
+                  critical=True,
+              )
+              .sign(key, hashes.SHA256())
+          )
+
+          # NoEncryption() не помог — cryptography всё равно пишет MAC
+          # через PBMAC1+PBKDF2 (Apple Security не понимает). Builder с
+          # hmac_hash(SHA1) даёт классический PKCS#12 MAC (PKCS#5 v1
+          # KDF + HMAC-SHA1), но требует непустой пароль. Использую
+          # "secret" — GenerateProfiles.py и ImportCertificates.py
+          # пропатчены sed'ом ниже шагом, чтобы передавать тот же пароль.
+          encryption = (
+              PrivateFormat.PKCS12.encryption_builder()
+              .key_cert_algorithm(pkcs12.PBES.PBESv1SHA1And3KeyTripleDESCBC)
+              .hmac_hash(hashes.SHA1())
+              .build(b"secret")
+          )
+          p12_bytes = pkcs12.serialize_key_and_certificates(
+              name=b"Opengram Fake Signing",
+              key=key,
+              cert=cert,
+              cas=None,
+              encryption_algorithm=encryption,
+          )
+
+          out = "build-system/fake-codesigning/certs"
+          with open(f"{out}/SelfSigned.p12", "wb") as f:
+              f.write(p12_bytes)
+          with open(f"{out}/Public.cer", "wb") as f:
+              f.write(cert.public_bytes(serialization.Encoding.DER))
+          print(f"Wrote SelfSigned.p12 ({len(p12_bytes)} bytes) and Public.cer")
+          EOF
+          # Sanity-check — homebrew openssl с -legacy старый формат разбирает
+          openssl pkcs12 -in build-system/fake-codesigning/certs/SelfSigned.p12 \
+            -passin pass:secret -nokeys -legacy | openssl x509 -noout -subject
+
+      - name: Patch p12 password to "secret" in build scripts
+        run: |
+          set -x
+          cd /Users/Shared/telegram-ios
+          # GenerateProfiles.py и ImportCertificates.py хардкодят пустой
+          # пароль на p12 ("fake-codesigning uses empty password"). После
+          # перехода на python cryptography с обязательным непустым
+          # паролем им надо подставить "secret". Прохожусь по обоим
+          # файлам с assert'ами, чтобы фейлиться сразу если паттерн
+          # не нашёлся (а не молча идти в codesign error).
+          python3 - <<'EOF'
+          import re, pathlib
+          gp_path = pathlib.Path('build-system/Make/GenerateProfiles.py')
+          gp = gp_path.read_text()
+          new_gp = gp.replace("p12_password = ''", "p12_password = 'secret'")
+          assert new_gp != gp, "GenerateProfiles patch didn't match"
+          gp_path.write_text(new_gp)
+
+          ic_path = pathlib.Path('build-system/Make/ImportCertificates.py')
+          ic = ic_path.read_text()
+          # Два инстанса '-P','' с разным индентом (16 spaces в for-loop,
+          # 8 spaces на top-level). Использую regex с \s+ — match'ится
+          # любой indent.
+          new_ic, n = re.subn(r"('-P',\s+)''(?=,?\s*\n)", r"\1'secret'", ic)
+          assert n == 2, f"ImportCertificates patch matched {n} times, expected 2"
+          ic_path.write_text(new_ic)
+          print(f"Patched: GP=1, IC={n}")
+          EOF
+          # Полный grep, без head — чтобы видно было оба файла
+          grep -n "secret\|p12_password\|'-P'" \
+            build-system/Make/GenerateProfiles.py \
+            build-system/Make/ImportCertificates.py
+
+      - name: Regenerate fake provisioning profiles
+        run: |
+          set -x
+          cd /Users/Shared/telegram-ios
+          # Беру свежесгенерированный SelfSigned.p12, выдираю его cert в DER,
+          # подменяю DeveloperCertificates[0] во всех .mobileprovision файлах
+          # и заново подписываю plist через cms -S тем же cert+key. После
+          # этого bazel/codesign в sandbox по hash из профайла найдёт нашу
+          # identity в keychain и сможет подписать .ipa.
+          # Логика — в build-system/Make/GenerateProfiles.py, готовая.
+          REGEN_DIR="$PWD/build-input/regen-profiles"
+          rm -rf "$REGEN_DIR"
+          mkdir -p "$REGEN_DIR"
+          python3 - <<'EOF'
+          import sys
+          sys.path.insert(0, 'build-system/Make')
+          import GenerateProfiles
+          GenerateProfiles.generate_provisioning_profiles(
+              source_path='build-system/fake-codesigning/profiles',
+              destination_path='build-input/regen-profiles',
+              certs_path='build-system/fake-codesigning/certs',
+          )
+          EOF
+          cp -f "$REGEN_DIR"/*.mobileprovision build-system/fake-codesigning/profiles/
+
+      - name: Build the App
+        run: |
+          set -x
+
+          SOURCE_DIR=/Users/Shared/telegram-ios
+          BAZEL_USER_ROOT="/private/var/tmp/_bazel_containerhost"
+
+          cd "$SOURCE_DIR"
+
+          BUILD_NUMBER_OFFSET="$(cat build_number_offset)"
+
+          export APP_VERSION=$(cat versions.json | python3 -c 'import json,sys;obj=json.load(sys.stdin);print(obj["app"]);')
+          export COMMIT_COUNT=$(git rev-list --count HEAD)
+          export COMMIT_COUNT="$(($COMMIT_COUNT+$BUILD_NUMBER_OFFSET))"
+          export BUILD_NUMBER="$COMMIT_COUNT"
+          echo "BUILD_NUMBER=$BUILD_NUMBER" >> $GITHUB_ENV
+          echo "APP_VERSION=$APP_VERSION" >> $GITHUB_ENV
+
+          # Импорт SelfSigned.p12 в login.keychain. Профайлы шагом выше
+          # уже переподписаны нашим cert, так что bazel matching отработает.
+          python3 build-system/Make/ImportCertificates.py --path build-system/fake-codesigning/certs
+
+          # ImportCertificates импортирует pair OK ("1 identity imported"),
+          # но security find-identity -v -p codesigning возвращает 0 —
+          # потому что -v фильтрует на trust-validated, а self-signed cert
+          # не в trust store. Нужно явно довериться нашему cert как
+          # codeSigning root в системном keychain'е, тогда find-identity -v
+          # его увидит и bazel rules_apple тоже.
+          echo "=== Trusting Public.cer as codeSigning root ==="
+          sudo security add-trusted-cert -d -r trustRoot \
+            -p codeSign \
+            -k /Library/Keychains/System.keychain \
+            build-system/fake-codesigning/certs/Public.cer
+
+          echo "=== identities for codesigning (after trust) ==="
+          security find-identity -v -p codesigning || true
+          # release_arm64 — реальная device-сборка, на выходе .ipa который
+          # ставится через Sideloadly / TrollStore / AltStore. --disableExtensions
+          # оставляю: extensions (Widget/Share/Watch/Intents) тащат за собой
+          # entitlements, которые apple-issued profile подтверждает на App Store
+          # серверах — даже с переподписью fake-cert эти entitlements в runtime
+          # отвалятся. Для sideload main-app достаточно.
+          python3 -u build-system/Make/Make.py \
+            --bazelUserRoot="$BAZEL_USER_ROOT" \
+            build \
+            --configurationPath="build-system/appstore-configuration.json" \
+            --codesigningInformationPath=build-system/fake-codesigning \
+            --configuration=release_arm64 \
+            --buildNumber="$BUILD_NUMBER" \
+            --disableExtensions
+
+          # Сборка артефактов: .ipa + .dSYM. Использую симлинк bazel-bin
+          # (он указывает на актуальный bazel-out/<config-hash>/bin), а не
+          # на сам bazel-out с глобом — config-hash в имени папки меняется
+          # между версиями bazel и unmatched glob становится литералом, cp
+          # падает на 'No such file or directory'.
+          OUTPUT_PATH="build/artifacts"
+          rm -rf "$OUTPUT_PATH"
+          mkdir -p "$OUTPUT_PATH"
+          cp bazel-bin/Telegram/Telegram.ipa "$OUTPUT_PATH/"
+
+          mkdir -p build/DSYMs
+          shopt -s nullglob
+          for f in bazel-bin/Telegram/*.dSYM; do
+            cp -R "$f" build/DSYMs/
+          done
+          (cd build && zip -r "../$OUTPUT_PATH/Telegram.DSYMs.zip" DSYMs >/dev/null)
+
+      # Артефакты прикладываю к workflow run всегда (и для PR, и для master)
+      - name: Upload IPA artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Telegram-${{ env.BUILD_NUMBER }}-ipa
+          path: /Users/Shared/telegram-ios/build/artifacts/Telegram.ipa
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Upload DSYMs artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Telegram-${{ env.BUILD_NUMBER }}-dsyms
+          path: /Users/Shared/telegram-ios/build/artifacts/Telegram.DSYMs.zip
+          retention-days: 30
+          if-no-files-found: error
+
+      # GitHub Release создаю только из master, не из PR
+      - name: Create Release with assets
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ env.BUILD_NUMBER }}
+          name: Opengram ${{ env.APP_VERSION }} (${{ env.BUILD_NUMBER }})
+          body: |
+            Unsigned iOS build of Opengram (форк telegram-ios) ${{ env.APP_VERSION }} (${{ env.BUILD_NUMBER }}).
+            Установка через Sideloadly / TrollStore / AltStore.
+          draft: false
+          prerelease: false
+          files: |
+            /Users/Shared/telegram-ios/build/artifacts/Telegram.ipa
+            /Users/Shared/telegram-ios/build/artifacts/Telegram.DSYMs.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

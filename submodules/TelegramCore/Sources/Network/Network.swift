@@ -549,7 +549,7 @@ func initializedNetwork(accountId: AccountRecordId, arguments: NetworkInitializa
             }
             
             context.keychain = keychain
-            var wrappedAdditionalSource: MTSignal?
+            // var wrappedAdditionalSource: MTSignal?
             #if os(iOS)
             if #available(iOS 10.0, *), !supplementary, arguments.isICloudEnabled {
                 var cloudDataContextValue: CloudDataContext?
@@ -559,24 +559,24 @@ func initializedNetwork(accountId: AccountRecordId, arguments: NetworkInitializa
                     cloudDataContextValue = makeCloudDataContext(encryptionProvider: arguments.encryptionProvider)
                     let _ = cloudDataContext.swap(cloudDataContextValue)
                 }
-                
-                if let cloudDataContext = cloudDataContextValue {
-                    wrappedAdditionalSource = MTSignal(generator: { subscriber in
-                        let disposable = cloudDataContext.get(phoneNumber: .single(phoneNumber)).start(next: { value in
-                            subscriber?.putNext(value)
-                        }, completed: {
-                            subscriber?.putCompletion()
-                        })
-                        return MTBlockDisposable(block: {
-                            disposable.dispose()
-                        })
-                    })
-                }
+
+                // if let cloudDataContext = cloudDataContextValue {
+                //     wrappedAdditionalSource = MTSignal(generator: { subscriber in
+                //         let disposable = cloudDataContext.get(phoneNumber: .single(phoneNumber)).start(next: { value in
+                //             subscriber?.putNext(value)
+                //         }, completed: {
+                //             subscriber?.putCompletion()
+                //         })
+                //         return MTBlockDisposable(block: {
+                //             disposable.dispose()
+                //         })
+                //     })
+                // }
             }
             #endif
-            
+
             if !supplementary {
-                context.setDiscoverBackupAddressListSignal(MTBackupAddressSignals.fetchBackupIps(testingEnvironment, currentContext: context, additionalSource: wrappedAdditionalSource, phoneNumber: phoneNumber, mainDatacenterId: datacenterId))
+                // context.setDiscoverBackupAddressListSignal(MTBackupAddressSignals.fetchBackupIps(testingEnvironment, currentContext: context, additionalSource: wrappedAdditionalSource, phoneNumber: phoneNumber, mainDatacenterId: datacenterId))
                 let externalRequestVerificationStream = arguments.externalRequestVerificationStream
                 context.setExternalRequestVerification({ nonce in
                     return MTSignal(generator: { subscriber in

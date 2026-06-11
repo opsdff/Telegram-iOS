@@ -249,7 +249,7 @@ typedef enum {
             {
 #if DEBUG
                 if (arc4random_uniform(100) < 50) {
-                    [mtProto simulateDisconnection];
+                    // [mtProto simulateDisconnection];
                 }
 #endif
                 
