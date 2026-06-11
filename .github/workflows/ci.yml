@@ -256,19 +256,14 @@ jobs:
           echo "=== identities for codesigning (after trust) ==="
           security find-identity -v -p codesigning || true
           # release_arm64 — реальная device-сборка, на выходе .ipa который
-          # ставится через Sideloadly / TrollStore / AltStore. --disableExtensions
-          # оставляю: extensions (Widget/Share/Watch/Intents) тащат за собой
-          # entitlements, которые apple-issued profile подтверждает на App Store
-          # серверах — даже с переподписью fake-cert эти entitlements в runtime
-          # отвалятся. Для sideload main-app достаточно.
+          # ставится через Sideloadly / TrollStore / AltStore.
           python3 -u build-system/Make/Make.py \
             --bazelUserRoot="$BAZEL_USER_ROOT" \
             build \
             --configurationPath="build-system/appstore-configuration.json" \
             --codesigningInformationPath=build-system/fake-codesigning \
             --configuration=release_arm64 \
-            --buildNumber="$BUILD_NUMBER" \
-            --disableExtensions
+            --buildNumber="$BUILD_NUMBER"
 
           # Сборка артефактов: .ipa + .dSYM. Использую симлинк bazel-bin
           # (он указывает на актуальный bazel-out/<config-hash>/bin), а не
